@@ -10,9 +10,11 @@ const adminToken = process.env.ADMIN_TOKEN || '';
 const dataDir = path.join(__dirname, 'data');
 const uploadDir = path.join(__dirname, 'uploads');
 const soundsFile = path.join(dataDir, 'sounds.json');
+const feedbackFile = path.join(dataDir, 'feedback.json');
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadDir, { recursive: true });
 if (!fs.existsSync(soundsFile)) fs.writeFileSync(soundsFile, '[]');
+if (!fs.existsSync(feedbackFile)) fs.writeFileSync(feedbackFile, '[]');
 
 const storage = multer.diskStorage({
   destination: (_req, _file, callback) => callback(null, uploadDir),
@@ -23,11 +25,11 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_req, file, callback) => file.mimetype.startsWith('audio/') ? callback(null, true) : callback(new Error('Please choose an audio file.'))
 });
-
+app.use(express.json({ limit: '8kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(uploadDir, { fallthrough: false }));
 
-app.get('/api/sounds', (_req, res) => res.json(readSounds()));
+app.get('/api/sounds', (_req, res) => res.json(readJson(soundsFile)));
 
 app.post('/api/admin/verify', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Set ADMIN_TOKEN in the hosting environment first.' });
@@ -37,30 +39,38 @@ app.post('/api/admin/verify', (req, res) => {
 
 app.post('/api/sounds', upload.single('audio'), (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
-  const addedBy = typeof req.body.username === 'string' ? req.body.username.trim().slice(0, 32) : '';
+  const addedBy = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
   const sourceUrl = typeof req.body.sourceUrl === 'string' ? req.body.sourceUrl.trim() : '';
   if (!addedBy) return res.status(400).json({ message: 'Enter your username before adding a sound.' });
   if (!name) return res.status(400).json({ message: 'Enter a sound name.' });
   if (!req.file && !isHttpUrl(sourceUrl)) return res.status(400).json({ message: 'Upload an audio file or enter an HTTP(S) URL.' });
-
-  const sound = {
-    id: crypto.randomUUID(),
-    name,
-    addedBy,
-    sourceUrl: req.file ? `/uploads/${req.file.filename}` : sourceUrl,
-    createdAt: new Date().toISOString()
-  };
-  const sounds = readSounds();
+  const sound = { id: crypto.randomUUID(), name, addedBy, sourceUrl: req.file ? `/uploads/${req.file.filename}` : sourceUrl, createdAt: new Date().toISOString() };
+  const sounds = readJson(soundsFile);
   sounds.push(sound);
-  writeSounds(sounds);
+  writeJson(soundsFile, sounds);
   res.status(201).json(sound);
 });
 
-// The download action is owner-only. Public audio playback remains available on the board.
-app.get('/api/sounds/:id/download', (req, res) => {
-  if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
-  if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Only the board owner can download sounds.' });
-  const sound = readSounds().find((item) => item.id === req.params.id);
+// Feedback is write-only for visitors; only an authenticated owner can read the inbox.
+app.post('/api/feedback', (req, res) => {
+  const username = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
+  const type = req.body.type === 'issue' ? 'issue' : req.body.type === 'feedback' ? 'feedback' : '';
+  const message = typeof req.body.message === 'string' ? req.body.message.trim().slice(0, 1500) : '';
+  if (!username) return res.status(400).json({ message: 'Please enter your username.' });
+  if (!type) return res.status(400).json({ message: 'Choose feedback or report an issue.' });
+  if (message.length < 5) return res.status(400).json({ message: 'Please include a little more detail (at least 5 characters).' });
+  const inbox = readJson(feedbackFile);
+  inbox.push({ id: crypto.randomUUID(), username, type, message, createdAt: new Date().toISOString() });
+  writeJson(feedbackFile, inbox.slice(-500));
+  res.status(201).json({ ok: true, message: 'Thanks! Your message was sent to the board owner.' });
+});
+
+app.get('/api/admin/feedback', requireAdmin, (_req, res) => {
+  res.json(readJson(feedbackFile).slice().reverse());
+});
+
+app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
+  const sound = readJson(soundsFile).find((item) => item.id === req.params.id);
   if (!sound) return res.status(404).json({ message: 'Sound not found.' });
   if (sound.sourceUrl.startsWith('/uploads/')) {
     const filename = path.basename(sound.sourceUrl);
@@ -71,14 +81,12 @@ app.get('/api/sounds/:id/download', (req, res) => {
   res.redirect(sound.sourceUrl);
 });
 
-app.delete('/api/sounds/:id', (req, res) => {
-  if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
-  if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Only the board owner can remove sounds.' });
-  const sounds = readSounds();
+app.delete('/api/sounds/:id', requireAdmin, (req, res) => {
+  const sounds = readJson(soundsFile);
   const index = sounds.findIndex((sound) => sound.id === req.params.id);
   if (index < 0) return res.status(404).json({ message: 'Sound not found.' });
   const [removed] = sounds.splice(index, 1);
-  writeSounds(sounds);
+  writeJson(soundsFile, sounds);
   if (removed.sourceUrl.startsWith('/uploads/')) {
     const filePath = path.join(uploadDir, path.basename(removed.sourceUrl));
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -93,18 +101,19 @@ app.use((error, _req, res, _next) => {
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.listen(port, () => console.log(`LNSB listening on port ${port}`));
 
-function readSounds() {
-  try {
-    const value = JSON.parse(fs.readFileSync(soundsFile, 'utf8'));
-    return Array.isArray(value) ? value : [];
-  } catch {
-    return [];
-  }
+function requireAdmin(req, res, next) {
+  if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
+  if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Only the board owner can access this.' });
+  next();
 }
-function writeSounds(sounds) {
-  const temporary = `${soundsFile}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(sounds, null, 2));
-  fs.renameSync(temporary, soundsFile);
+function readJson(file) {
+  try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(value) ? value : []; }
+  catch { return []; }
+}
+function writeJson(file, value) {
+  const temporary = `${file}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(value, null, 2));
+  fs.renameSync(temporary, file);
 }
 function isHttpUrl(value) {
   try { return ['http:', 'https:'].includes(new URL(value).protocol); }
