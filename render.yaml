@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: lnsb
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ADMIN_TOKEN
+        sync: false
