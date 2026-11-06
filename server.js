@@ -12,10 +12,12 @@ const uploadDir = path.join(__dirname, 'uploads');
 const soundsFile = path.join(dataDir, 'sounds.json');
 const feedbackFile = path.join(dataDir, 'feedback.json');
 const accessFile = path.join(dataDir, 'access-code.json');
+const nicknamesFile = path.join(dataDir, 'nicknames.json');
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadDir, { recursive: true });
 if (!fs.existsSync(soundsFile)) fs.writeFileSync(soundsFile, '[]');
 if (!fs.existsSync(feedbackFile)) fs.writeFileSync(feedbackFile, '[]');
+if (!fs.existsSync(nicknamesFile)) fs.writeFileSync(nicknamesFile, '{}');
 if (!fs.existsSync(accessFile) && process.env.ACCESS_CODE) saveAccessCode(process.env.ACCESS_CODE);
 
 const storage = multer.diskStorage({
@@ -38,7 +40,6 @@ app.post('/api/access/verify', (req, res) => {
   res.json({ ok: true });
 });
 
-// Admin recovery: verify the owner token and issue a short-lived HttpOnly bypass cookie.
 app.post('/api/admin/access-bypass', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Incorrect admin passcode.' });
@@ -48,7 +49,28 @@ app.post('/api/admin/access-bypass', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/sounds', requireAccess, (_req, res) => res.json(readJson(soundsFile)));
+app.get('/api/sounds', requireAccess, (_req, res) => res.json(readArray(soundsFile)));
+app.post('/api/nicknames/claim', requireAccess, (req, res) => {
+  const displayName = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
+  if (displayName.length < 2) return res.status(400).json({ message: 'Nicknames must be at least 2 characters.' });
+  if (/[\u0000-\u001f\u007f]/.test(displayName)) return res.status(400).json({ message: 'That nickname contains invalid characters.' });
+  const normalized = normalizeNickname(displayName);
+  const claims = readObject(nicknamesFile);
+  const existing = claims[normalized];
+  if (existing) {
+    const providedKey = req.body.claimKey;
+    if (typeof providedKey !== 'string' || !verifySecret(providedKey, existing.salt, existing.hash)) {
+      return res.status(409).json({ message: 'That nickname is already taken. Please choose another one.' });
+    }
+    return res.json({ ok: true, username: existing.username, claimKey: providedKey });
+  }
+  const claimKey = crypto.randomBytes(32).toString('base64url');
+  const salt = crypto.randomBytes(16).toString('hex');
+  claims[normalized] = { username: displayName, salt, hash: hashSecret(claimKey, salt) };
+  writeJson(nicknamesFile, claims);
+  res.status(201).json({ ok: true, username: displayName, claimKey });
+});
+
 app.post('/api/admin/verify', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Set ADMIN_TOKEN in the hosting environment first.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Incorrect admin token.' });
@@ -60,34 +82,30 @@ app.post('/api/admin/access-code', requireAdmin, (req, res) => {
   saveAccessCode(code);
   res.json({ ok: true, message: 'Board access code updated. Share the new code with your visitors.' });
 });
-app.post('/api/sounds', requireAccess, upload.single('audio'), (req, res) => {
+app.post('/api/sounds', requireAccess, requireNickname, upload.single('audio'), (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
-  const addedBy = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
   const sourceUrl = typeof req.body.sourceUrl === 'string' ? req.body.sourceUrl.trim() : '';
-  if (!addedBy) return res.status(400).json({ message: 'Enter your username before adding a sound.' });
   if (!name) return res.status(400).json({ message: 'Enter a sound name.' });
   if (!req.file && !isHttpUrl(sourceUrl)) return res.status(400).json({ message: 'Upload an audio file or enter an HTTP(S) URL.' });
-  const sound = { id: crypto.randomUUID(), name, addedBy, sourceUrl: req.file ? `/uploads/${req.file.filename}` : sourceUrl, createdAt: new Date().toISOString() };
-  const sounds = readJson(soundsFile);
+  const sound = { id: crypto.randomUUID(), name, addedBy: req.claimedNickname.username, sourceUrl: req.file ? `/uploads/${req.file.filename}` : sourceUrl, createdAt: new Date().toISOString() };
+  const sounds = readArray(soundsFile);
   sounds.push(sound);
   writeJson(soundsFile, sounds);
   res.status(201).json(sound);
 });
-app.post('/api/feedback', requireAccess, (req, res) => {
-  const username = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
+app.post('/api/feedback', requireAccess, requireNickname, (req, res) => {
   const type = req.body.type === 'issue' ? 'issue' : req.body.type === 'feedback' ? 'feedback' : '';
   const message = typeof req.body.message === 'string' ? req.body.message.trim().slice(0, 1500) : '';
-  if (!username) return res.status(400).json({ message: 'Please enter your username.' });
   if (!type) return res.status(400).json({ message: 'Choose feedback or report an issue.' });
   if (message.length < 5) return res.status(400).json({ message: 'Please include a little more detail (at least 5 characters).' });
-  const inbox = readJson(feedbackFile);
-  inbox.push({ id: crypto.randomUUID(), username, type, message, createdAt: new Date().toISOString() });
+  const inbox = readArray(feedbackFile);
+  inbox.push({ id: crypto.randomUUID(), username: req.claimedNickname.username, type, message, createdAt: new Date().toISOString() });
   writeJson(feedbackFile, inbox.slice(-500));
   res.status(201).json({ ok: true, message: 'Thanks! Your message was sent to the board owner.' });
 });
-app.get('/api/admin/feedback', requireAdmin, (_req, res) => res.json(readJson(feedbackFile).slice().reverse()));
+app.get('/api/admin/feedback', requireAdmin, (_req, res) => res.json(readArray(feedbackFile).slice().reverse()));
 app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
-  const sound = readJson(soundsFile).find((item) => item.id === req.params.id);
+  const sound = readArray(soundsFile).find((item) => item.id === req.params.id);
   if (!sound) return res.status(404).json({ message: 'Sound not found.' });
   if (sound.sourceUrl.startsWith('/uploads/')) {
     const filename = path.basename(sound.sourceUrl);
@@ -98,7 +116,7 @@ app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
   res.redirect(sound.sourceUrl);
 });
 app.delete('/api/sounds/:id', requireAdmin, (req, res) => {
-  const sounds = readJson(soundsFile);
+  const sounds = readArray(soundsFile);
   const index = sounds.findIndex((sound) => sound.id === req.params.id);
   if (index < 0) return res.status(404).json({ message: 'Sound not found.' });
   const [removed] = sounds.splice(index, 1);
@@ -120,6 +138,14 @@ function requireAccess(req, res, next) {
   if (!readAccessCode()) return res.status(503).json({ message: 'Board access is not configured.' });
   if (isValidAccessCode(req.get('x-access-code') || '') || isValidAdminBypass(req)) return next();
   return res.status(403).json({ message: 'Enter the current board access code or use the owner passcode.' });
+}
+function requireNickname(req, res, next) {
+  const name = req.get('x-nickname') || '';
+  const key = req.get('x-nickname-key') || '';
+  const claim = readObject(nicknamesFile)[normalizeNickname(name)];
+  if (!claim || !key || !verifySecret(key, claim.salt, claim.hash)) return res.status(403).json({ message: 'Claim your unique nickname again before continuing.' });
+  req.claimedNickname = claim;
+  next();
 }
 function requireAdmin(req, res, next) {
   if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
@@ -152,9 +178,24 @@ function isValidAccessCode(candidate) {
   const expected = Buffer.from(config.hash, 'hex');
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
-function readJson(file) {
+function normalizeNickname(value) {
+  return value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
+}
+function hashSecret(secret, salt) {
+  return crypto.scryptSync(secret, salt, 64).toString('hex');
+}
+function verifySecret(secret, salt, expectedHash) {
+  const actual = Buffer.from(hashSecret(secret, salt), 'hex');
+  const expected = Buffer.from(expectedHash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+function readArray(file) {
   try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(value) ? value : []; }
   catch { return []; }
+}
+function readObject(file) {
+  try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
+  catch { return {}; }
 }
 function writeJson(file, value) {
   const temporary = `${file}.tmp`;
