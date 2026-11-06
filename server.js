@@ -147,7 +147,7 @@ function requireAccess(req, res, next) {
 function requireNickname(req, res, next) {
   const name = req.get('x-nickname') || '', key = req.get('x-nickname-key') || '';
   const claim = readObject(nicknamesFile)[normalizeNickname(name)];
-  if (!claim || !key || !verifySecret(key, claim.salt, claim.hash)) return res.status(403).json({ message: 'Claim your unique nickname again before continuing.' });
+  if (!claim || !key || !verifySecret(key, claim.salt, claim.hash)) return res.status(401).json({ message: 'Your nickname claim is missing or expired. Please claim your nickname again; your board access session is still active.' });
   req.claimedNickname = claim; next();
 }
 function requireAdmin(req, res, next) {
