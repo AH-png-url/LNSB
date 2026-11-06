@@ -8,3 +8,5 @@ services:
     envVars:
       - key: ADMIN_TOKEN
         sync: false
+      - key: ACCESS_CODE
+        sync: false
