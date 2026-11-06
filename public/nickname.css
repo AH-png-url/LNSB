@@ -1,2 +1,2 @@
-/* Nickname claim feedback */
-#nicknameError{min-height:14px;margin:0 0 8px;color:#c43c51;font-size:11px}
+/* Code-management panel and global access reset action */
+.code-controls hr{border:0;border-top:1px solid #e8e8ec;margin:13px 0}.danger-button{border:1px solid #f1c7ce;border-radius:7px;background:#fff3f4;color:#a52c3d;padding:8px 10px;font:600 10px 'DM Sans',sans-serif;cursor:pointer}.danger-button:hover{background:#ffe5e8}.danger-button:disabled{opacity:.55;cursor:wait}

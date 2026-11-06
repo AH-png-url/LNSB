@@ -31,24 +31,23 @@ const upload = multer({
 });
 app.use(express.json({ limit: '8kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(uploadDir, { fallthrough: false }));
+app.use('/uploads', requireAccess, express.static(uploadDir, { fallthrough: false }));
 
 app.post('/api/access/verify', (req, res) => {
   const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
-  if (!readAccessCode()) return res.status(503).json({ message: 'Access code is not configured. The owner must set ACCESS_CODE on the hosting service.' });
+  if (!readAccessCode()) return res.status(503).json({ message: 'Access code is not configured. Set ACCESS_CODE on the hosting service.' });
   if (!isValidAccessCode(code)) return res.status(403).json({ message: 'That access code is not correct.' });
+  issueAccessCookie(req, res);
   res.json({ ok: true });
 });
+app.get('/api/access/session', requireAccess, (_req, res) => res.json({ ok: true }));
 
 app.post('/api/admin/access-bypass', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Incorrect admin passcode.' });
-  const cookieValue = createAdminBypassCookie();
-  const secure = req.secure || req.get('x-forwarded-proto') === 'https';
-  res.setHeader('Set-Cookie', `lnsb_admin_access=${cookieValue}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400${secure ? '; Secure' : ''}`);
+  issueAccessCookie(req, res);
   res.json({ ok: true });
 });
-
 app.get('/api/sounds', requireAccess, (_req, res) => res.json(readArray(soundsFile)));
 app.post('/api/nicknames/claim', requireAccess, (req, res) => {
   const displayName = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
@@ -59,9 +58,7 @@ app.post('/api/nicknames/claim', requireAccess, (req, res) => {
   const existing = claims[normalized];
   if (existing) {
     const providedKey = req.body.claimKey;
-    if (typeof providedKey !== 'string' || !verifySecret(providedKey, existing.salt, existing.hash)) {
-      return res.status(409).json({ message: 'That nickname is already taken. Please choose another one.' });
-    }
+    if (typeof providedKey !== 'string' || !verifySecret(providedKey, existing.salt, existing.hash)) return res.status(409).json({ message: 'That nickname is already taken. Please choose another one.' });
     return res.json({ ok: true, username: existing.username, claimKey: providedKey });
   }
   const claimKey = crypto.randomBytes(32).toString('base64url');
@@ -70,7 +67,6 @@ app.post('/api/nicknames/claim', requireAccess, (req, res) => {
   writeJson(nicknamesFile, claims);
   res.status(201).json({ ok: true, username: displayName, claimKey });
 });
-
 app.post('/api/admin/verify', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Set ADMIN_TOKEN in the hosting environment first.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Incorrect admin token.' });
@@ -79,8 +75,17 @@ app.post('/api/admin/verify', (req, res) => {
 app.post('/api/admin/access-code', requireAdmin, (req, res) => {
   const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
   if (code.length < 6 || code.length > 128) return res.status(400).json({ message: 'Choose a code between 6 and 128 characters.' });
-  saveAccessCode(code);
-  res.json({ ok: true, message: 'Board access code updated. Share the new code with your visitors.' });
+  saveAccessCode(code); // Rotates the session secret, logging out every existing visitor.
+  issueAccessCookie(req, res);
+  res.json({ ok: true, message: 'Board access code updated. Existing visitor sessions were reset.' });
+});
+app.post('/api/admin/reset-access', requireAdmin, (_req, res) => {
+  const config = readAccessCode();
+  if (!config) return res.status(503).json({ message: 'Board access code is not configured.' });
+  config.sessionSecret = crypto.randomBytes(32).toString('hex');
+  writeJson(accessFile, config);
+  clearAccessCookie(res);
+  res.json({ ok: true, message: 'All visitor sessions were reset. Everyone must enter the current board code again.' });
 });
 app.post('/api/sounds', requireAccess, requireNickname, upload.single('audio'), (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
@@ -88,9 +93,7 @@ app.post('/api/sounds', requireAccess, requireNickname, upload.single('audio'), 
   if (!name) return res.status(400).json({ message: 'Enter a sound name.' });
   if (!req.file && !isHttpUrl(sourceUrl)) return res.status(400).json({ message: 'Upload an audio file or enter an HTTP(S) URL.' });
   const sound = { id: crypto.randomUUID(), name, addedBy: req.claimedNickname.username, sourceUrl: req.file ? `/uploads/${req.file.filename}` : sourceUrl, createdAt: new Date().toISOString() };
-  const sounds = readArray(soundsFile);
-  sounds.push(sound);
-  writeJson(soundsFile, sounds);
+  const sounds = readArray(soundsFile); sounds.push(sound); writeJson(soundsFile, sounds);
   res.status(201).json(sound);
 });
 app.post('/api/feedback', requireAccess, requireNickname, (req, res) => {
@@ -98,8 +101,7 @@ app.post('/api/feedback', requireAccess, requireNickname, (req, res) => {
   const message = typeof req.body.message === 'string' ? req.body.message.trim().slice(0, 1500) : '';
   if (!type) return res.status(400).json({ message: 'Choose feedback or report an issue.' });
   if (message.length < 5) return res.status(400).json({ message: 'Please include a little more detail (at least 5 characters).' });
-  const inbox = readArray(feedbackFile);
-  inbox.push({ id: crypto.randomUUID(), username: req.claimedNickname.username, type, message, createdAt: new Date().toISOString() });
+  const inbox = readArray(feedbackFile); inbox.push({ id: crypto.randomUUID(), username: req.claimedNickname.username, type, message, createdAt: new Date().toISOString() });
   writeJson(feedbackFile, inbox.slice(-500));
   res.status(201).json({ ok: true, message: 'Thanks! Your message was sent to the board owner.' });
 });
@@ -108,23 +110,17 @@ app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
   const sound = readArray(soundsFile).find((item) => item.id === req.params.id);
   if (!sound) return res.status(404).json({ message: 'Sound not found.' });
   if (sound.sourceUrl.startsWith('/uploads/')) {
-    const filename = path.basename(sound.sourceUrl);
-    const filePath = path.join(uploadDir, filename);
+    const filename = path.basename(sound.sourceUrl), filePath = path.join(uploadDir, filename);
     if (!fs.existsSync(filePath)) return res.status(404).json({ message: 'Audio file not found.' });
     return res.download(filePath, `${safeDownloadName(sound.name)}${path.extname(filename)}`);
   }
   res.redirect(sound.sourceUrl);
 });
 app.delete('/api/sounds/:id', requireAdmin, (req, res) => {
-  const sounds = readArray(soundsFile);
-  const index = sounds.findIndex((sound) => sound.id === req.params.id);
+  const sounds = readArray(soundsFile), index = sounds.findIndex((sound) => sound.id === req.params.id);
   if (index < 0) return res.status(404).json({ message: 'Sound not found.' });
-  const [removed] = sounds.splice(index, 1);
-  writeJson(soundsFile, sounds);
-  if (removed.sourceUrl.startsWith('/uploads/')) {
-    const filePath = path.join(uploadDir, path.basename(removed.sourceUrl));
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  }
+  const [removed] = sounds.splice(index, 1); writeJson(soundsFile, sounds);
+  if (removed.sourceUrl.startsWith('/uploads/')) { const filePath = path.join(uploadDir, path.basename(removed.sourceUrl)); if (fs.existsSync(filePath)) fs.unlinkSync(filePath); }
   res.json({ ok: true });
 });
 app.use((error, _req, res, _next) => {
@@ -136,81 +132,64 @@ app.listen(port, () => console.log(`LNSB listening on port ${port}`));
 
 function requireAccess(req, res, next) {
   if (!readAccessCode()) return res.status(503).json({ message: 'Board access is not configured.' });
-  if (isValidAccessCode(req.get('x-access-code') || '') || isValidAdminBypass(req)) return next();
+  if (isValidAccessSession(req)) return next();
+  clearAccessCookie(res);
   return res.status(403).json({ message: 'Enter the current board access code or use the owner passcode.' });
 }
 function requireNickname(req, res, next) {
-  const name = req.get('x-nickname') || '';
-  const key = req.get('x-nickname-key') || '';
+  const name = req.get('x-nickname') || '', key = req.get('x-nickname-key') || '';
   const claim = readObject(nicknamesFile)[normalizeNickname(name)];
   if (!claim || !key || !verifySecret(key, claim.salt, claim.hash)) return res.status(403).json({ message: 'Claim your unique nickname again before continuing.' });
-  req.claimedNickname = claim;
-  next();
+  req.claimedNickname = claim; next();
 }
 function requireAdmin(req, res, next) {
   if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Only the board owner can access this.' });
   next();
 }
-function createAdminBypassCookie() {
-  return crypto.createHmac('sha256', adminToken).update('lnsb-admin-access-v1').digest('hex');
-}
-function isValidAdminBypass(req) {
-  const cookie = (req.headers.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith('lnsb_admin_access='));
-  if (!cookie || !adminToken) return false;
-  const candidate = Buffer.from(decodeURIComponent(cookie.slice('lnsb_admin_access='.length)));
-  const expected = Buffer.from(createAdminBypassCookie());
-  return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
-}
 function readAccessCode() {
-  try { const config = JSON.parse(fs.readFileSync(accessFile, 'utf8')); return config && config.salt && config.hash ? config : null; }
-  catch { return null; }
+  try {
+    const config = JSON.parse(fs.readFileSync(accessFile, 'utf8'));
+    if (!config || !config.salt || !config.hash) return null;
+    if (!config.sessionSecret) { config.sessionSecret = crypto.randomBytes(32).toString('hex'); writeJson(accessFile, config); }
+    return config;
+  } catch { return null; }
 }
 function saveAccessCode(code) {
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(code, salt, 64).toString('hex');
-  writeJson(accessFile, { salt, hash });
+  writeJson(accessFile, { salt, hash: crypto.scryptSync(code, salt, 64).toString('hex'), sessionSecret: crypto.randomBytes(32).toString('hex') });
+}
+function issueAccessCookie(req, res) {
+  const config = readAccessCode();
+  const value = crypto.createHmac('sha256', config.sessionSecret).update('lnsb-access-session-v1').digest('hex');
+  const secure = req.secure || req.get('x-forwarded-proto') === 'https';
+  res.setHeader('Set-Cookie', `lnsb_access=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000${secure ? '; Secure' : ''}`);
+}
+function clearAccessCookie(res) { res.setHeader('Set-Cookie', 'lnsb_access=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); }
+function isValidAccessSession(req) {
+  const part = (req.headers.cookie || '').split(';').map((item) => item.trim()).find((item) => item.startsWith('lnsb_access='));
+  const config = readAccessCode(); if (!part || !config) return false;
+  const supplied = Buffer.from(part.slice('lnsb_access='.length));
+  const expected = Buffer.from(crypto.createHmac('sha256', config.sessionSecret).update('lnsb-access-session-v1').digest('hex'));
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 function isValidAccessCode(candidate) {
-  const config = readAccessCode();
-  if (!config || !candidate) return false;
-  const actual = crypto.scryptSync(candidate, config.salt, 64);
-  const expected = Buffer.from(config.hash, 'hex');
+  const config = readAccessCode(); if (!config || !candidate) return false;
+  const actual = crypto.scryptSync(candidate, config.salt, 64), expected = Buffer.from(config.hash, 'hex');
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
-function normalizeNickname(value) {
-  return value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
-}
-function hashSecret(secret, salt) {
-  return crypto.scryptSync(secret, salt, 64).toString('hex');
-}
+function normalizeNickname(value) { return value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US'); }
+function hashSecret(secret, salt) { return crypto.scryptSync(secret, salt, 64).toString('hex'); }
 function verifySecret(secret, salt, expectedHash) {
-  const actual = Buffer.from(hashSecret(secret, salt), 'hex');
-  const expected = Buffer.from(expectedHash, 'hex');
+  const actual = Buffer.from(hashSecret(secret, salt), 'hex'), expected = Buffer.from(expectedHash, 'hex');
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
-function readArray(file) {
-  try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(value) ? value : []; }
-  catch { return []; }
-}
-function readObject(file) {
-  try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
-  catch { return {}; }
-}
-function writeJson(file, value) {
-  const temporary = `${file}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(value, null, 2));
-  fs.renameSync(temporary, file);
-}
-function isHttpUrl(value) {
-  try { return ['http:', 'https:'].includes(new URL(value).protocol); }
-  catch { return false; }
-}
+function readArray(file) { try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(value) ? value : []; } catch { return []; } }
+function readObject(file) { try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; } catch { return {}; } }
+function writeJson(file, value) { const temporary = `${file}.tmp`; fs.writeFileSync(temporary, JSON.stringify(value, null, 2)); fs.renameSync(temporary, file); }
+function isHttpUrl(value) { try { return ['http:', 'https:'].includes(new URL(value).protocol); } catch { return false; } }
 function isValidAdminToken(candidate) {
-  const supplied = Buffer.from(candidate);
-  const expected = Buffer.from(adminToken);
+  const supplied = Buffer.from(candidate), expected = Buffer.from(adminToken);
   return Boolean(adminToken) && supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
-function safeDownloadName(value) {
-  return value.replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/\s+/g, '-') || 'sound';
-}
+function safeDownloadName(value) { return value.replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/\s+/g, '-') || 'sound'; }
