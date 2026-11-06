@@ -5,7 +5,22 @@
   <meta name="theme-color" content="#101114"><title>LNSB — Sound Buttons World</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/access.css">
 </head>
 <body>
-  <div id="accessGate" class="name-gate" hidden><form id="accessForm" class="name-card"><span class="brand-note">♫</span><p class="eyebrow">PRIVATE SOUND BOARD</p><h1>Enter the secret code</h1><p class="muted">Ask the board owner for the current access code.</p><label>Board access code<input id="accessCodeInput" type="password" autocomplete="current-password" placeholder="Enter secret code" required></label><p id="accessError" class="error" aria-live="polite"></p><button class="primary" type="submit">Unlock soundboard →</button></form></div>
+  <div id="accessGate" class="name-gate" hidden>
+    <form id="accessForm" class="name-card">
+      <span class="brand-note">♫</span><p class="eyebrow">PRIVATE SOUND BOARD</p><h1>Enter the secret code</h1>
+      <p class="muted">Ask the board owner for the current access code.</p>
+      <label>Board access code<input id="accessCodeInput" type="password" autocomplete="current-password" placeholder="Enter secret code" required></label>
+      <p id="accessError" class="error" aria-live="polite"></p>
+      <button class="primary" type="submit">Unlock soundboard →</button>
+      <button id="showOwnerRecovery" class="recovery-link" type="button">Owner? Forgot the board code?</button>
+      <div id="ownerRecovery" class="owner-recovery" hidden>
+        <p>Enter your private admin passcode to unlock owner access.</p>
+        <label>Admin passcode<input id="recoveryAdminToken" type="password" autocomplete="current-password" placeholder="Private admin passcode"></label>
+        <p id="recoveryError" class="error" aria-live="polite"></p>
+        <button id="recoverAccess" class="primary" type="button">Unlock as owner</button>
+      </div>
+    </form>
+  </div>
   <div id="nameGate" class="name-gate" hidden><form id="nameForm" class="name-card"><span class="brand-note">♫</span><p class="eyebrow">WELCOME TO THE BOARD</p><h1>What should we call you?</h1><p class="muted">Choose a username to view and add sounds.</p><label>Your username<input id="usernameInput" maxlength="32" autocomplete="nickname" placeholder="Enter a username" required></label><button class="primary" type="submit">Enter soundboard →</button></form></div>
   <main id="app" class="shell" hidden>
     <header><a class="brand" href="/" aria-label="LNSB home"><span class="brand-note">♫</span><span><small>SOUND BUTTONS WORLD</small><b>LNSB</b></span></a><span id="welcome" class="welcome"></span><div class="header-actions"><button id="share" class="quiet owner-only" hidden>↗ Share board</button><button id="changeName" class="quiet">Change name</button><button id="menu" class="quiet menu-button" aria-label="Show admin controls">☰</button></div></header>

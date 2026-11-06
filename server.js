@@ -38,21 +38,28 @@ app.post('/api/access/verify', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/sounds', requireAccess, (_req, res) => res.json(readJson(soundsFile)));
+// Admin recovery: verify the owner token and issue a short-lived HttpOnly bypass cookie.
+app.post('/api/admin/access-bypass', (req, res) => {
+  if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
+  if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Incorrect admin passcode.' });
+  const cookieValue = createAdminBypassCookie();
+  const secure = req.secure || req.get('x-forwarded-proto') === 'https';
+  res.setHeader('Set-Cookie', `lnsb_admin_access=${cookieValue}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400${secure ? '; Secure' : ''}`);
+  res.json({ ok: true });
+});
 
+app.get('/api/sounds', requireAccess, (_req, res) => res.json(readJson(soundsFile)));
 app.post('/api/admin/verify', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Set ADMIN_TOKEN in the hosting environment first.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Incorrect admin token.' });
   res.json({ ok: true });
 });
-
 app.post('/api/admin/access-code', requireAdmin, (req, res) => {
   const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
   if (code.length < 6 || code.length > 128) return res.status(400).json({ message: 'Choose a code between 6 and 128 characters.' });
   saveAccessCode(code);
   res.json({ ok: true, message: 'Board access code updated. Share the new code with your visitors.' });
 });
-
 app.post('/api/sounds', requireAccess, upload.single('audio'), (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
   const addedBy = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
@@ -66,7 +73,6 @@ app.post('/api/sounds', requireAccess, upload.single('audio'), (req, res) => {
   writeJson(soundsFile, sounds);
   res.status(201).json(sound);
 });
-
 app.post('/api/feedback', requireAccess, (req, res) => {
   const username = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
   const type = req.body.type === 'issue' ? 'issue' : req.body.type === 'feedback' ? 'feedback' : '';
@@ -79,9 +85,7 @@ app.post('/api/feedback', requireAccess, (req, res) => {
   writeJson(feedbackFile, inbox.slice(-500));
   res.status(201).json({ ok: true, message: 'Thanks! Your message was sent to the board owner.' });
 });
-
 app.get('/api/admin/feedback', requireAdmin, (_req, res) => res.json(readJson(feedbackFile).slice().reverse()));
-
 app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
   const sound = readJson(soundsFile).find((item) => item.id === req.params.id);
   if (!sound) return res.status(404).json({ message: 'Sound not found.' });
@@ -93,7 +97,6 @@ app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
   }
   res.redirect(sound.sourceUrl);
 });
-
 app.delete('/api/sounds/:id', requireAdmin, (req, res) => {
   const sounds = readJson(soundsFile);
   const index = sounds.findIndex((sound) => sound.id === req.params.id);
@@ -106,7 +109,6 @@ app.delete('/api/sounds/:id', requireAdmin, (req, res) => {
   }
   res.json({ ok: true });
 });
-
 app.use((error, _req, res, _next) => {
   if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ message: 'Audio files must be 20 MB or smaller.' });
   res.status(400).json({ message: error.message || 'Request failed.' });
@@ -116,13 +118,23 @@ app.listen(port, () => console.log(`LNSB listening on port ${port}`));
 
 function requireAccess(req, res, next) {
   if (!readAccessCode()) return res.status(503).json({ message: 'Board access is not configured.' });
-  if (!isValidAccessCode(req.get('x-access-code') || '')) return res.status(403).json({ message: 'Enter the current board access code to continue.' });
-  next();
+  if (isValidAccessCode(req.get('x-access-code') || '') || isValidAdminBypass(req)) return next();
+  return res.status(403).json({ message: 'Enter the current board access code or use the owner passcode.' });
 }
 function requireAdmin(req, res, next) {
   if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Only the board owner can access this.' });
   next();
+}
+function createAdminBypassCookie() {
+  return crypto.createHmac('sha256', adminToken).update('lnsb-admin-access-v1').digest('hex');
+}
+function isValidAdminBypass(req) {
+  const cookie = (req.headers.cookie || '').split(';').map((part) => part.trim()).find((part) => part.startsWith('lnsb_admin_access='));
+  if (!cookie || !adminToken) return false;
+  const candidate = Buffer.from(decodeURIComponent(cookie.slice('lnsb_admin_access='.length)));
+  const expected = Buffer.from(createAdminBypassCookie());
+  return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
 }
 function readAccessCode() {
   try { const config = JSON.parse(fs.readFileSync(accessFile, 'utf8')); return config && config.salt && config.hash ? config : null; }
