@@ -11,10 +11,12 @@ const dataDir = path.join(__dirname, 'data');
 const uploadDir = path.join(__dirname, 'uploads');
 const soundsFile = path.join(dataDir, 'sounds.json');
 const feedbackFile = path.join(dataDir, 'feedback.json');
+const accessFile = path.join(dataDir, 'access-code.json');
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadDir, { recursive: true });
 if (!fs.existsSync(soundsFile)) fs.writeFileSync(soundsFile, '[]');
 if (!fs.existsSync(feedbackFile)) fs.writeFileSync(feedbackFile, '[]');
+if (!fs.existsSync(accessFile) && process.env.ACCESS_CODE) saveAccessCode(process.env.ACCESS_CODE);
 
 const storage = multer.diskStorage({
   destination: (_req, _file, callback) => callback(null, uploadDir),
@@ -29,7 +31,14 @@ app.use(express.json({ limit: '8kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(uploadDir, { fallthrough: false }));
 
-app.get('/api/sounds', (_req, res) => res.json(readJson(soundsFile)));
+app.post('/api/access/verify', (req, res) => {
+  const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
+  if (!readAccessCode()) return res.status(503).json({ message: 'Access code is not configured. The owner must set ACCESS_CODE on the hosting service.' });
+  if (!isValidAccessCode(code)) return res.status(403).json({ message: 'That access code is not correct.' });
+  res.json({ ok: true });
+});
+
+app.get('/api/sounds', requireAccess, (_req, res) => res.json(readJson(soundsFile)));
 
 app.post('/api/admin/verify', (req, res) => {
   if (!adminToken) return res.status(503).json({ message: 'Set ADMIN_TOKEN in the hosting environment first.' });
@@ -37,7 +46,14 @@ app.post('/api/admin/verify', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/sounds', upload.single('audio'), (req, res) => {
+app.post('/api/admin/access-code', requireAdmin, (req, res) => {
+  const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
+  if (code.length < 6 || code.length > 128) return res.status(400).json({ message: 'Choose a code between 6 and 128 characters.' });
+  saveAccessCode(code);
+  res.json({ ok: true, message: 'Board access code updated. Share the new code with your visitors.' });
+});
+
+app.post('/api/sounds', requireAccess, upload.single('audio'), (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
   const addedBy = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
   const sourceUrl = typeof req.body.sourceUrl === 'string' ? req.body.sourceUrl.trim() : '';
@@ -51,8 +67,7 @@ app.post('/api/sounds', upload.single('audio'), (req, res) => {
   res.status(201).json(sound);
 });
 
-// Feedback is write-only for visitors; only an authenticated owner can read the inbox.
-app.post('/api/feedback', (req, res) => {
+app.post('/api/feedback', requireAccess, (req, res) => {
   const username = typeof req.body.username === 'string' ? req.body.username.trim().replace(/\s+/g, ' ').slice(0, 32) : '';
   const type = req.body.type === 'issue' ? 'issue' : req.body.type === 'feedback' ? 'feedback' : '';
   const message = typeof req.body.message === 'string' ? req.body.message.trim().slice(0, 1500) : '';
@@ -65,9 +80,7 @@ app.post('/api/feedback', (req, res) => {
   res.status(201).json({ ok: true, message: 'Thanks! Your message was sent to the board owner.' });
 });
 
-app.get('/api/admin/feedback', requireAdmin, (_req, res) => {
-  res.json(readJson(feedbackFile).slice().reverse());
-});
+app.get('/api/admin/feedback', requireAdmin, (_req, res) => res.json(readJson(feedbackFile).slice().reverse()));
 
 app.get('/api/sounds/:id/download', requireAdmin, (req, res) => {
   const sound = readJson(soundsFile).find((item) => item.id === req.params.id);
@@ -101,10 +114,31 @@ app.use((error, _req, res, _next) => {
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.listen(port, () => console.log(`LNSB listening on port ${port}`));
 
+function requireAccess(req, res, next) {
+  if (!readAccessCode()) return res.status(503).json({ message: 'Board access is not configured.' });
+  if (!isValidAccessCode(req.get('x-access-code') || '')) return res.status(403).json({ message: 'Enter the current board access code to continue.' });
+  next();
+}
 function requireAdmin(req, res, next) {
   if (!adminToken) return res.status(503).json({ message: 'Owner access is not configured.' });
   if (!isValidAdminToken(req.get('x-admin-token') || '')) return res.status(403).json({ message: 'Only the board owner can access this.' });
   next();
+}
+function readAccessCode() {
+  try { const config = JSON.parse(fs.readFileSync(accessFile, 'utf8')); return config && config.salt && config.hash ? config : null; }
+  catch { return null; }
+}
+function saveAccessCode(code) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(code, salt, 64).toString('hex');
+  writeJson(accessFile, { salt, hash });
+}
+function isValidAccessCode(candidate) {
+  const config = readAccessCode();
+  if (!config || !candidate) return false;
+  const actual = crypto.scryptSync(candidate, config.salt, 64);
+  const expected = Buffer.from(config.hash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 function readJson(file) {
   try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(value) ? value : []; }
